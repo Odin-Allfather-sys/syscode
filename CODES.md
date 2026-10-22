@@ -42,6 +42,8 @@ tmpfs, EFI, squashfs and overlay mounts are excluded.
 - `D80-D89` WATCH — plan a cleanup
 - `D90-D100` ALERT — act now; full disks cause data loss and service failures
 
+`DNA` = unknown (no qualifying mounted filesystem found).
+
 ### MEM — `M29`
 RAM used %, computed as `(total - available) / total`. "Available" already
 counts reclaimable cache, so this is the honest number.
@@ -97,6 +99,7 @@ Noisy hardware/drivers can inflate this; trend matters more than raw count.
 - `J20-J100` WATCH — worth a look at what is repeating
 - `J101+` ALERT
 
+`JNA` = unknown (`journalctl` unavailable, or the invoking user lacks access).
 Counts reflect the invoking user's journal privileges; an unprivileged run
 may undercount.
 
