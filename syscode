@@ -1,0 +1,229 @@
+#!/usr/bin/env bash
+# syscode - one-line system health code you can hand to an AI.
+#
+# Usage:
+#   syscode             scan and print the code + quick hints
+#   syscode --code      print only the code (pipe-friendly)
+#   syscode --explain   human-readable breakdown with OK/WATCH/ALERT states
+#   syscode --no-net    skip the internet check
+#   syscode --version   print version
+#
+# Code definitions: CODES.md in the repo.
+# Exit code: 0 = clean, 1 = something to watch, 2 = something to act on.
+
+set -uo pipefail
+VERSION="1.0.0"
+
+MODE="full"; NET=1
+for arg in "$@"; do
+  case "$arg" in
+    --code)    MODE="code" ;;
+    --explain) MODE="explain" ;;
+    --net)     NET=1 ;;
+    --no-net)  NET=0 ;;
+    --version) echo "syscode $VERSION"; exit 0 ;;
+    -h|--help) sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) echo "unknown option: $arg (try --help)" >&2; exit 1 ;;
+  esac
+done
+
+worst=0   # 0 clean, 1 watch, 2 alert
+bump() { (( "$1" > worst )) && worst="$1" || true; }
+check() { # $1=value $2=watch_at $3=alert_at
+  if (( "$1" >= "$3" )); then bump 2
+  elif (( "$1" >= "$2" )); then bump 1
+  fi
+}
+
+# --- OS -----------------------------------------------------------------
+os_id="UNK"; os_ver="00"
+if [[ -r /etc/os-release ]]; then
+  # shellcheck source=/dev/null
+  . /etc/os-release
+  os_id=$(printf '%s' "${ID:-unknown}" | tr '[:lower:]' '[:upper:]' | cut -c1-3)
+  [[ -n "${VERSION_ID:-}" ]] && os_ver="${VERSION_ID%%.*}"
+fi
+OS_SEG="${os_id}${os_ver}"
+
+# --- Disk: worst mounted real filesystem --------------------------------
+disk_pct=-1; disk_mount="-"
+while read -r pct mnt; do
+  case "$mnt" in /|/boot|/home|/var|/opt|/srv|/mnt/*|/media/*|/data*) ;; *) continue ;; esac
+  (( pct > disk_pct )) && { disk_pct="$pct"; disk_mount="$mnt"; }
+done < <(df -P -x tmpfs -x devtmpfs -x squashfs -x efivarfs -x vfat -x iso9660 -x overlay 2>/dev/null \
+         | awk 'NR>1 {sub(/%/,"",$5); print $5, $6}')
+if (( disk_pct >= 0 )); then
+  DISK_SEG=$(printf 'D%02d' "$disk_pct")
+  (( disk_pct >= 90 )) && bump 2 || { (( disk_pct >= 80 )) && bump 1 || true; }
+else
+  DISK_SEG="DNA"
+fi
+
+# --- Memory ---------------------------------------------------------------
+mem_avail=$(awk '/^MemAvailable:/{a=$2} /^MemFree:/{f=$2} END{print (a?a:f)}' /proc/meminfo)
+mem_total=$(awk '/^MemTotal:/{print $2}' /proc/meminfo)
+mem_avail=${mem_avail:-0}; mem_total=${mem_total:-0}
+if (( mem_total > 0 )); then
+  mem_pct=$(( (mem_total - mem_avail) * 100 / mem_total ))
+  MEM_SEG=$(printf 'M%02d' "$mem_pct")
+  check "$mem_pct" 80 93
+else
+  MEM_SEG="MNA"; mem_pct=-1
+fi
+
+# --- Swap -----------------------------------------------------------------
+swap_total=$(awk '/^SwapTotal:/{print $2}' /proc/meminfo)
+swap_free=$(awk '/^SwapFree:/{print $2}' /proc/meminfo)
+swap_total=${swap_total:-0}; swap_free=${swap_free:-0}
+if (( swap_total > 0 )); then
+  swap_pct=$(( (swap_total - swap_free) * 100 / swap_total ))
+  SWAP_SEG=$(printf 'SW%02d' "$swap_pct")
+  check "$swap_pct" 50 80
+else
+  SWAP_SEG="SWX"; swap_pct=-1
+fi
+
+# --- Load: 1-min average as % of CPU cores --------------------------------
+load1=$(cut -d' ' -f1 /proc/loadavg)
+cores=$(nproc 2>/dev/null || echo 1)
+load_pct=$(awk -v l="$load1" -v c="$cores" 'BEGIN{printf "%d", (l/c)*100}')
+LOAD_SEG=$(printf 'LD%03d' "$load_pct")
+check "$load_pct" 70 101
+
+# --- Failed systemd units ---------------------------------------------------
+if command -v systemctl >/dev/null 2>&1; then
+  failed=$(systemctl --failed --no-legend --plain 2>/dev/null | grep -c . || true)
+  SVC_SEG="S${failed:-0}"
+  check "${failed:-0}" 1 3
+else
+  SVC_SEG="SNA"; failed=-1
+fi
+
+# --- Reboot pending? (rpm distros) ------------------------------------------
+running_kernel=$(uname -r)
+if command -v rpm >/dev/null 2>&1; then
+  latest_kernel=$(rpm -q kernel 2>/dev/null | sed 's/^kernel-//' | sort -V | tail -1)
+  if [[ -n "$latest_kernel" && "$latest_kernel" != "$running_kernel" ]]; then
+    REB_SEG="K1"; bump 1
+  else
+    REB_SEG="K0"
+  fi
+else
+  REB_SEG="KNA"
+fi
+
+# --- Uptime ------------------------------------------------------------------
+up_days=$(awk '{printf "%d", $1/86400}' /proc/uptime)
+UP_SEG=$(printf 'U%03d' "$up_days")
+
+# --- Journal error lines this boot --------------------------------------------
+if command -v journalctl >/dev/null 2>&1; then
+  jerr=$(journalctl -p 3 -b -q --no-pager 2>/dev/null | grep -c . || true)
+  JRN_SEG="J${jerr:-0}"
+  check "${jerr:-0}" 20 101
+else
+  JRN_SEG="JNA"; jerr=-1
+fi
+
+# --- Containers: unhealthy or restarting / running -----------------------------
+ctr=""; ctr_prefix=()
+if command -v docker >/dev/null 2>&1 && docker ps >/dev/null 2>&1; then
+  ctr="docker"
+elif command -v docker >/dev/null 2>&1 && command -v sudo >/dev/null 2>&1 && sudo -n docker ps >/dev/null 2>&1; then
+  ctr="docker"; ctr_prefix=(sudo)   # rootful docker, user has NOPASSWD sudo
+elif command -v podman >/dev/null 2>&1 && podman ps >/dev/null 2>&1; then
+  ctr="podman"
+fi
+if [[ -n "$ctr" ]]; then
+  ctr_total=$("${ctr_prefix[@]}" "$ctr" ps --format '{{.Names}}' 2>/dev/null | grep -c . || true)
+  ctr_bad=$("${ctr_prefix[@]}" "$ctr" ps --format '{{.Status}}' 2>/dev/null | grep -Eic 'unhealthy|restarting' || true)
+  CT_SEG="C${ctr_bad:-0}/${ctr_total:-0}"
+  (( ${ctr_bad:-0} > 0 )) && bump 1
+else
+  CT_SEG="CNA"; ctr_bad=-1; ctr_total=-1
+fi
+
+# --- Internet -------------------------------------------------------------------
+if (( NET )); then
+  if ping -c1 -W2 1.1.1.1 >/dev/null 2>&1; then NET_SEG="NT+"; else NET_SEG="NT-"; bump 1; fi
+else
+  NET_SEG="NTX"
+fi
+
+CODE="SYS1-${OS_SEG}-${DISK_SEG}-${MEM_SEG}-${SWAP_SEG}-${LOAD_SEG}-${SVC_SEG}-${REB_SEG}-${UP_SEG}-${JRN_SEG}-${CT_SEG}-${NET_SEG}"
+
+if [[ "$MODE" == "code" ]]; then
+  printf '%s\n' "$CODE"
+elif [[ "$MODE" == "explain" ]]; then
+  row() { printf '%-5s %-9s %-46s %s\n' "$1" "$2" "$3" "$4"; }
+  echo "$CODE"
+  echo
+  row SEG VALUE MEANING STATE
+  row --- ----- ------- -----
+  row OS "$OS_SEG" "distro + major version" "info"
+  if (( disk_pct >= 0 )); then
+    if   (( disk_pct >= 90 )); then dst="ALERT"
+    elif (( disk_pct >= 80 )); then dst="WATCH"
+    else dst="OK"; fi
+    row DISK "$DISK_SEG" "worst filesystem used% ($disk_mount)" "$dst"
+  else
+    row DISK "$DISK_SEG" "worst filesystem used%" "unknown"
+  fi
+  if (( mem_pct >= 0 )); then
+    if   (( mem_pct >= 93 )); then mst="ALERT"
+    elif (( mem_pct >= 80 )); then mst="WATCH"
+    else mst="OK"; fi
+    row MEM "$MEM_SEG" "RAM used% (available-based)" "$mst"
+  else
+    row MEM "$MEM_SEG" "RAM used%" "unknown"
+  fi
+  if (( swap_pct >= 0 )); then
+    if   (( swap_pct >= 80 )); then sst="ALERT"
+    elif (( swap_pct >= 50 )); then sst="WATCH"
+    else sst="OK"; fi
+    row SWAP "$SWAP_SEG" "swap used%" "$sst"
+  else
+    row SWAP "$SWAP_SEG" "no swap configured" "OK"
+  fi
+  if   (( load_pct > 100 )); then lst="ALERT"
+  elif (( load_pct >= 70 )); then lst="WATCH"
+  else lst="OK"; fi
+  row LOAD "$LOAD_SEG" "1-min load vs $cores core(s), %" "$lst"
+  if (( failed >= 0 )); then
+    if   (( failed >= 3 )); then vst="ALERT"
+    elif (( failed >= 1 )); then vst="WATCH"
+    else vst="OK"; fi
+    row SVC "$SVC_SEG" "failed systemd units" "$vst"
+  else
+    row SVC "$SVC_SEG" "failed systemd units" "unknown"
+  fi
+  row REB "$REB_SEG" "newer kernel installed than running" "$([[ $REB_SEG == K1 ]] && echo WATCH || echo OK)"
+  row UP "$UP_SEG" "uptime in days" "info"
+  if (( jerr >= 0 )); then
+    if   (( jerr > 100 )); then jst="ALERT"
+    elif (( jerr >= 20 )); then jst="WATCH"
+    else jst="OK"; fi
+    row JRN "$JRN_SEG" "journal error lines this boot" "$jst"
+  else
+    row JRN "$JRN_SEG" "journal error lines this boot" "unknown"
+  fi
+  if (( ctr_bad >= 0 )); then
+    row CT "$CT_SEG" "unhealthy/restarting of running containers" "$((( ctr_bad > 0 )) && echo WATCH || echo OK)"
+  else
+    row CT "$CT_SEG" "no container runtime or no permission" "info"
+  fi
+  case "$NET_SEG" in
+    "NT+") row NET "$NET_SEG" "internet reachable (ping 1.1.1.1)" "OK" ;;
+    "NT-") row NET "$NET_SEG" "no ping reply (offline or ICMP blocked)" "WATCH" ;;
+    *)     row NET "$NET_SEG" "internet check skipped" "info" ;;
+  esac
+  echo
+  echo "exit code $worst (0 clean, 1 watch, 2 alert)"
+  echo "definitions: see CODES.md"
+else
+  printf '%s\n' "$CODE"
+  echo "# syscode --explain  → human-readable breakdown"
+  echo "# paste this code + CODES.md into any AI for an interpretation"
+fi
+
+exit "$worst"
